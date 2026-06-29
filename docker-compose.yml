@@ -1,0 +1,153 @@
+version: "3.8"
+
+# SocialSphere Analytics Platform - local development stack
+#
+# Services:
+#   minio              S3-compatible object storage (bronze/silver/gold data lake)
+#   minio-init          one-shot job that creates the 'socialsphere' bucket
+#   ingestion_service    FastAPI event ingestion API
+#   postgres             Airflow metadata database
+#   airflow-init         one-shot Airflow DB migration + admin user creation
+#   airflow-webserver    Airflow UI (http://localhost:8080)
+#   airflow-scheduler    Airflow DAG scheduler/executor
+#   dashboard            Streamlit dashboard (http://localhost:8501)
+#
+# Quick start:
+#   docker-compose up -d minio minio-init postgres
+#   docker-compose up -d ingestion_service
+#   python event_generator/generate_events.py --events 100000
+#   (upload generated bronze files to MinIO, or point Spark jobs at local dir)
+#   docker-compose up -d airflow-init airflow-webserver airflow-scheduler
+#   docker-compose up -d dashboard
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: socialsphere_minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: socialsphere_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-minioadmin} ${MINIO_SECRET_KEY:-minioadmin};
+      mc mb --ignore-existing local/socialsphere;
+      mc mb --ignore-existing local/socialsphere/bronze;
+      mc mb --ignore-existing local/socialsphere/silver;
+      mc mb --ignore-existing local/socialsphere/gold;
+      exit 0;
+      "
+
+  ingestion_service:
+    build:
+      context: ./ingestion_service
+    container_name: socialsphere_ingestion
+    ports:
+      - "8000:8000"
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: socialsphere
+      BRONZE_PREFIX: bronze/events
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  postgres:
+    image: postgres:15
+    container_name: socialsphere_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-init:
+    image: apache/airflow:2.9.2
+    container_name: socialsphere_airflow_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    entrypoint: >
+      /bin/bash -c "
+      airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com
+      "
+
+  airflow-webserver:
+    image: apache/airflow:2.9.2
+    container_name: socialsphere_airflow_webserver
+    depends_on:
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./data_quality:/opt/airflow/data_quality
+      - ./data:/opt/airflow/data
+    ports:
+      - "8080:8080"
+    command: webserver
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.2
+    container_name: socialsphere_airflow_scheduler
+    depends_on:
+      - airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./data_quality:/opt/airflow/data_quality
+      - ./data:/opt/airflow/data
+    command: scheduler
+
+  dashboard:
+    build:
+      context: ./dashboard
+    container_name: socialsphere_dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      GOLD_DATA_ROOT: /app/data/gold
+    volumes:
+      - ./data/gold:/app/data/gold
+    command: streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+
+volumes:
+  minio_data:
+  postgres_data:
